@@ -165,6 +165,13 @@ struct _TSDemuxStream
   GstClockTime pts;
   GstClockTime dts;
 
+  /* Reference PTS used to detect gaps */
+  GstClockTime gap_ref_pts;
+  /* Number of outputted buffers */
+  guint32 nb_out_buffers;
+  /* Reference number of buffers for gaps */
+  guint32 gap_ref_buffers;
+
   /* Current PTS/DTS for this stream (in 90kHz unit) */
   guint64 raw_pts, raw_dts;
 
@@ -1398,10 +1405,13 @@ gst_ts_demux_stream_added (MpegTSBase * base, MpegTSBaseStream * bstream,
     stream->discont = TRUE;
     stream->pts = GST_CLOCK_TIME_NONE;
     stream->dts = GST_CLOCK_TIME_NONE;
+    stream->first_dts = GST_CLOCK_TIME_NONE;
     stream->raw_pts = -1;
     stream->raw_dts = -1;
     stream->pending_ts = TRUE;
-    stream->first_dts = GST_CLOCK_TIME_NONE;
+    stream->nb_out_buffers = 0;
+    stream->gap_ref_buffers = 0;
+    stream->gap_ref_pts = GST_CLOCK_TIME_NONE;
     stream->continuity_counter = CONTINUITY_UNSET;
   }
 }
@@ -1497,6 +1507,9 @@ gst_ts_demux_stream_flush (TSDemuxStream * stream, GstTSDemux * tsdemux)
   stream->raw_pts = -1;
   stream->raw_dts = -1;
   stream->pending_ts = TRUE;
+  stream->nb_out_buffers = 0;
+  stream->gap_ref_buffers = 0;
+  stream->gap_ref_pts = GST_CLOCK_TIME_NONE;
   stream->continuity_counter = CONTINUITY_UNSET;
 }
 
@@ -1521,6 +1534,7 @@ gst_ts_demux_program_started (MpegTSBase * base, MpegTSBaseProgram * program)
 
   if (demux->requested_program_number == program->program_number ||
       (demux->requested_program_number == -1 && demux->program_number == -1)) {
+    GList *tmp;
 
     GST_LOG ("program %d started", program->program_number);
     demux->program_number = program->program_number;
@@ -1531,6 +1545,11 @@ gst_ts_demux_program_started (MpegTSBase * base, MpegTSBaseProgram * program)
     demux->calculate_update_segment = !program->initial_program;
 
     /* FIXME : When do we emit no_more_pads ? */
+    for (tmp = program->stream_list; tmp; tmp = tmp->next) {
+      TSDemuxStream *stream = (TSDemuxStream *) tmp->data;
+      activate_pad_for_stream (demux, stream);
+    }
+
   }
 }
 
@@ -1973,32 +1992,37 @@ calculate_and_push_newsegment (GstTSDemux * demux, TSDemuxStream * stream)
   }
 
 push_new_segment:
-  if (demux->update_segment) {
-    GST_DEBUG_OBJECT (stream->pad, "Pushing update segment");
-    gst_event_ref (demux->update_segment);
-    gst_pad_push_event (stream->pad, demux->update_segment);
-  }
+  for (tmp = demux->program->stream_list; tmp; tmp = tmp->next) {
+    stream = (TSDemuxStream *) tmp->data;
+    if (stream->pad == NULL)
+      continue;
+    if (demux->update_segment) {
+      GST_DEBUG_OBJECT (stream->pad, "Pushing update segment");
+      gst_event_ref (demux->update_segment);
+      gst_pad_push_event (stream->pad, demux->update_segment);
+    }
 
-  if (demux->segment_event) {
-    GST_DEBUG_OBJECT (stream->pad, "Pushing newsegment event");
-    gst_event_ref (demux->segment_event);
-    gst_pad_push_event (stream->pad, demux->segment_event);
-  }
+    if (demux->segment_event) {
+      GST_DEBUG_OBJECT (stream->pad, "Pushing newsegment event");
+      gst_event_ref (demux->segment_event);
+      gst_pad_push_event (stream->pad, demux->segment_event);
+    }
 
-  if (demux->global_tags) {
-    gst_pad_push_event (stream->pad,
-        gst_event_new_tag (gst_tag_list_ref (demux->global_tags)));
-  }
+    if (demux->global_tags) {
+      gst_pad_push_event (stream->pad,
+          gst_event_new_tag (gst_tag_list_ref (demux->global_tags)));
+    }
 
-  /* Push pending tags */
-  if (stream->taglist) {
-    GST_DEBUG_OBJECT (stream->pad, "Sending tags %" GST_PTR_FORMAT,
-        stream->taglist);
-    gst_pad_push_event (stream->pad, gst_event_new_tag (stream->taglist));
-    stream->taglist = NULL;
-  }
+    /* Push pending tags */
+    if (stream->taglist) {
+      GST_DEBUG_OBJECT (stream->pad, "Sending tags %" GST_PTR_FORMAT,
+          stream->taglist);
+      gst_pad_push_event (stream->pad, gst_event_new_tag (stream->taglist));
+      stream->taglist = NULL;
+    }
 
-  stream->need_newsegment = FALSE;
+    stream->need_newsegment = FALSE;
+  }
 }
 
 static GstFlowReturn
@@ -2097,6 +2121,7 @@ gst_ts_demux_push_pending_data (GstTSDemux * demux, TSDemuxStream * stream)
       stream->discont = FALSE;
 
       res = gst_pad_push (stream->pad, pend->buffer);
+      stream->nb_out_buffers += 1;
       g_slice_free (PendingBuffer, pend);
     }
     g_list_free (stream->pending);
@@ -2134,9 +2159,58 @@ gst_ts_demux_push_pending_data (GstTSDemux * demux, TSDemuxStream * stream)
   stream->discont = FALSE;
 
   res = gst_pad_push (stream->pad, buffer);
+  stream->nb_out_buffers += 1;
   GST_DEBUG_OBJECT (stream->pad, "Returned %s", gst_flow_get_name (res));
   res = gst_flow_combiner_update_flow (demux->flowcombiner, res);
   GST_DEBUG_OBJECT (stream->pad, "combined %s", gst_flow_get_name (res));
+
+  if (G_UNLIKELY (stream->gap_ref_pts == GST_CLOCK_TIME_NONE))
+    stream->gap_ref_pts = stream->pts;
+  else {
+    if (G_UNLIKELY (stream->pts > stream->gap_ref_pts + 2 * GST_SECOND)) {
+      GstClockTime curpcr =
+          mpegts_packetizer_get_current_time (MPEG_TS_BASE_PACKETIZER (demux),
+          demux->program->pcr_pid);
+      GList *tmp;
+      if (curpcr == GST_CLOCK_TIME_NONE || curpcr < 800 * GST_MSECOND)
+        goto beach;
+      curpcr -= 800 * GST_MSECOND;
+      GST_WARNING ("Recheck streams ? now : %" GST_TIME_FORMAT,
+          GST_TIME_ARGS (curpcr));
+      for (tmp = demux->program->stream_list; tmp; tmp = tmp->next) {
+        TSDemuxStream *ps = (TSDemuxStream *) tmp->data;
+        GST_WARNING_OBJECT (ps->pad,
+            "0x%04x, PTS:%" GST_TIME_FORMAT " REFPTS:%" GST_TIME_FORMAT " Gap:%"
+            GST_TIME_FORMAT " nb_buffers: %d (ref:%d)",
+            ((MpegTSBaseStream *) ps)->pid, GST_TIME_ARGS (ps->pts),
+            GST_TIME_ARGS (ps->gap_ref_pts),
+            GST_TIME_ARGS (ps->pts - ps->gap_ref_pts), ps->nb_out_buffers,
+            ps->gap_ref_buffers);
+        if (ps->pad == NULL)
+          continue;
+        if (ps->nb_out_buffers == ps->gap_ref_buffers) {
+          GST_WARNING_OBJECT (ps->pad,
+              "No buffers pushed yet, we should push GAP event");
+          gst_pad_push_event (ps->pad, gst_event_new_gap (curpcr, 0));
+          ps->gap_ref_pts = curpcr;
+          /* } */
+          /* if (ps->pts == GST_CLOCK_TIME_NONE) { */
+          /*   GST_WARNING_OBJECT (ps->pad, */
+          /*       "No buffers seen yet, we should push GAP event"); */
+          /*   gst_pad_push_event (ps->pad, gst_event_new_gap (curpcr, 0)); */
+          /*   ps->gap_ref_pts = curpcr; */
+          /* } else if (ps->gap_ref_pts == ps->pts) { */
+          /*   GST_WARNING_OBJECT (ps->pad, */
+          /*       "No buffers pushed yet, we should push GAP event"); */
+          /*   gst_pad_push_event (ps->pad, gst_event_new_gap (curpcr, 0)); */
+          /*   ps->gap_ref_pts = curpcr; */
+        } else {
+          ps->gap_ref_pts = ps->pts;
+          ps->gap_ref_buffers = ps->nb_out_buffers;
+        }
+      }
+    }
+  }
 
 beach:
   /* Reset everything */
