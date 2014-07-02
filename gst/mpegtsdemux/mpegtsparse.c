@@ -189,6 +189,8 @@ mpegts_parse_init (MpegTSParse2 * parse)
 
   parse->srcpad = gst_pad_new_from_static_template (&src_template, "src");
   parse->first = TRUE;
+  gst_pad_set_query_function (parse->srcpad,
+      GST_DEBUG_FUNCPTR (mpegts_parse_src_pad_query));
   gst_element_add_pad (GST_ELEMENT (parse), parse->srcpad);
 
   parse->have_group_id = FALSE;
@@ -923,8 +925,7 @@ mpegts_parse_src_pad_query (GstPad * pad, GstObject * parent, GstQuery * query)
         if (is_live) {
           GstClockTime extra_latency = TS_LATENCY * GST_MSECOND;
           if (parse->set_timestamps) {
-            extra_latency = MAX (extra_latency,
-                parse->smoothing_latency * GST_USECOND);
+            extra_latency = MAX (extra_latency, parse->smoothing_latency);
           }
           min_latency += extra_latency;
           if (max_latency != GST_CLOCK_TIME_NONE)
