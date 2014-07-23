@@ -302,6 +302,8 @@ static void gst_ts_demux_stream_flush (TSDemuxStream * stream,
     GstTSDemux * demux);
 
 static gboolean push_event (MpegTSBase * base, GstEvent * event);
+static void gst_ts_demux_check_and_sync_streams (GstTSDemux * demux,
+    GstClockTime time);
 
 static void
 _extra_init (void)
@@ -1460,31 +1462,18 @@ gst_ts_demux_stream_removed (MpegTSBase * base, MpegTSBaseStream * bstream)
 static void
 activate_pad_for_stream (GstTSDemux * tsdemux, TSDemuxStream * stream)
 {
-  GList *tmp;
-  gboolean alldone = TRUE;
-
   if (stream->pad) {
     GST_DEBUG_OBJECT (tsdemux, "Activating pad %s:%s for stream %p",
         GST_DEBUG_PAD_NAME (stream->pad), stream);
     gst_element_add_pad ((GstElement *) tsdemux, stream->pad);
     stream->active = TRUE;
     GST_DEBUG_OBJECT (stream->pad, "done adding pad");
-
-    /* Check if all pads were activated, and if so emit no-more-pads */
-    for (tmp = tsdemux->program->stream_list; tmp; tmp = tmp->next) {
-      stream = (TSDemuxStream *) tmp->data;
-      if (stream->pad && !stream->active)
-        alldone = FALSE;
-    }
-    if (alldone) {
-      GST_DEBUG_OBJECT (tsdemux, "All pads were activated, emit no-more-pads");
-      gst_element_no_more_pads ((GstElement *) tsdemux);
-    }
-  } else
+  } else {
     GST_WARNING_OBJECT (tsdemux,
         "stream %p (pid 0x%04x, type:0x%03x) has no pad", stream,
         ((MpegTSBaseStream *) stream)->pid,
         ((MpegTSBaseStream *) stream)->stream_type);
+  }
 }
 
 static void
@@ -1544,12 +1533,12 @@ gst_ts_demux_program_started (MpegTSBase * base, MpegTSBaseProgram * program)
      * an update newsegment */
     demux->calculate_update_segment = !program->initial_program;
 
-    /* FIXME : When do we emit no_more_pads ? */
+    /* Add all streams, then fire no-more-pads */
     for (tmp = program->stream_list; tmp; tmp = tmp->next) {
       TSDemuxStream *stream = (TSDemuxStream *) tmp->data;
       activate_pad_for_stream (demux, stream);
     }
-
+    gst_element_no_more_pads ((GstElement *) demux);
   }
 }
 
@@ -2025,6 +2014,67 @@ push_new_segment:
   }
 }
 
+static void
+gst_ts_demux_check_and_sync_streams (GstTSDemux * demux, GstClockTime time)
+{
+  GList *tmp;
+
+  GST_DEBUG_OBJECT (demux,
+      "Recheck streams and sync to at least: %" GST_TIME_FORMAT,
+      GST_TIME_ARGS (time));
+
+  if (G_UNLIKELY (demux->program == NULL))
+    return;
+
+  /* Go over each stream and update it to at least 'time' time.
+   * For each stream, the pad stores the buffer counter the last time
+   * a gap check occurred (gap_ref_buffers) and a gap_ref_pts timestamp
+   * that is either the PTS from the stream or the PCR the pad was updated
+   * to.
+   *
+   * We can check nb_out_buffers to see if any buffers were pushed since then.
+   * This means we can detect buffers passing without PTSes fine and still generate
+   * gaps.
+   *
+   * If there haven't been any buffers pushed on this stream since the last
+   * gap check, push a gap event updating to the indicated input PCR time
+   * and update the pad's tracking.
+   *
+   * If there have been buffers pushed, update the reference buffer count
+   * and but don't push a gap event
+   */
+  for (tmp = demux->program->stream_list; tmp; tmp = tmp->next) {
+    TSDemuxStream *ps = (TSDemuxStream *) tmp->data;
+    GST_DEBUG_OBJECT (ps->pad,
+        "0x%04x, PTS:%" GST_TIME_FORMAT " REFPTS:%" GST_TIME_FORMAT " Gap:%"
+        GST_TIME_FORMAT " nb_buffers: %d (ref:%d)",
+        ((MpegTSBaseStream *) ps)->pid, GST_TIME_ARGS (ps->pts),
+        GST_TIME_ARGS (ps->gap_ref_pts),
+        GST_TIME_ARGS (ps->pts - ps->gap_ref_pts), ps->nb_out_buffers,
+        ps->gap_ref_buffers);
+    if (ps->pad == NULL)
+      continue;
+
+    if (ps->nb_out_buffers == ps->gap_ref_buffers && ps->gap_ref_pts != ps->pts) {
+      /* Do initial setup of pad if needed - segment etc */
+      GST_DEBUG_OBJECT (ps->pad,
+          "Stream needs update. Pushing GAP event to TS %" GST_TIME_FORMAT,
+          GST_TIME_ARGS (time));
+      if (G_UNLIKELY (ps->need_newsegment))
+        calculate_and_push_newsegment (demux, ps);
+
+      /* Now send gap event */
+      gst_pad_push_event (ps->pad, gst_event_new_gap (time, 0));
+    }
+
+    /* Update GAP tracking vars so we don't re-check this stream for a while */
+    ps->gap_ref_pts = time;
+    if (ps->pts != GST_CLOCK_TIME_NONE && ps->pts > time)
+      ps->gap_ref_pts = ps->pts;
+    ps->gap_ref_buffers = ps->nb_out_buffers;
+  }
+}
+
 static GstFlowReturn
 gst_ts_demux_push_pending_data (GstTSDemux * demux, TSDemuxStream * stream)
 {
@@ -2099,9 +2149,6 @@ gst_ts_demux_push_pending_data (GstTSDemux * demux, TSDemuxStream * stream)
     }
   }
 
-  if (G_UNLIKELY (!stream->active))
-    activate_pad_for_stream (demux, stream);
-
   if (G_UNLIKELY (stream->need_newsegment))
     calculate_and_push_newsegment (demux, stream);
 
@@ -2159,56 +2206,28 @@ gst_ts_demux_push_pending_data (GstTSDemux * demux, TSDemuxStream * stream)
   stream->discont = FALSE;
 
   res = gst_pad_push (stream->pad, buffer);
+  /* Record that a buffer was pushed */
   stream->nb_out_buffers += 1;
   GST_DEBUG_OBJECT (stream->pad, "Returned %s", gst_flow_get_name (res));
   res = gst_flow_combiner_update_flow (demux->flowcombiner, res);
   GST_DEBUG_OBJECT (stream->pad, "combined %s", gst_flow_get_name (res));
 
+  /* GAP / sparse stream tracking */
   if (G_UNLIKELY (stream->gap_ref_pts == GST_CLOCK_TIME_NONE))
     stream->gap_ref_pts = stream->pts;
   else {
-    if (G_UNLIKELY (stream->pts > stream->gap_ref_pts + 2 * GST_SECOND)) {
+    /* Look if the stream PTS has advanced 2 seconds since the last
+     * gap check, and sync streams if it has. The first stream to
+     * hit this will trigger a gap check */
+    if (G_UNLIKELY (stream->pts != GST_CLOCK_TIME_NONE &&
+            stream->pts > stream->gap_ref_pts + 2 * GST_SECOND)) {
       GstClockTime curpcr =
           mpegts_packetizer_get_current_time (MPEG_TS_BASE_PACKETIZER (demux),
           demux->program->pcr_pid);
-      GList *tmp;
       if (curpcr == GST_CLOCK_TIME_NONE || curpcr < 800 * GST_MSECOND)
         goto beach;
       curpcr -= 800 * GST_MSECOND;
-      GST_WARNING ("Recheck streams ? now : %" GST_TIME_FORMAT,
-          GST_TIME_ARGS (curpcr));
-      for (tmp = demux->program->stream_list; tmp; tmp = tmp->next) {
-        TSDemuxStream *ps = (TSDemuxStream *) tmp->data;
-        GST_WARNING_OBJECT (ps->pad,
-            "0x%04x, PTS:%" GST_TIME_FORMAT " REFPTS:%" GST_TIME_FORMAT " Gap:%"
-            GST_TIME_FORMAT " nb_buffers: %d (ref:%d)",
-            ((MpegTSBaseStream *) ps)->pid, GST_TIME_ARGS (ps->pts),
-            GST_TIME_ARGS (ps->gap_ref_pts),
-            GST_TIME_ARGS (ps->pts - ps->gap_ref_pts), ps->nb_out_buffers,
-            ps->gap_ref_buffers);
-        if (ps->pad == NULL)
-          continue;
-        if (ps->nb_out_buffers == ps->gap_ref_buffers) {
-          GST_WARNING_OBJECT (ps->pad,
-              "No buffers pushed yet, we should push GAP event");
-          gst_pad_push_event (ps->pad, gst_event_new_gap (curpcr, 0));
-          ps->gap_ref_pts = curpcr;
-          /* } */
-          /* if (ps->pts == GST_CLOCK_TIME_NONE) { */
-          /*   GST_WARNING_OBJECT (ps->pad, */
-          /*       "No buffers seen yet, we should push GAP event"); */
-          /*   gst_pad_push_event (ps->pad, gst_event_new_gap (curpcr, 0)); */
-          /*   ps->gap_ref_pts = curpcr; */
-          /* } else if (ps->gap_ref_pts == ps->pts) { */
-          /*   GST_WARNING_OBJECT (ps->pad, */
-          /*       "No buffers pushed yet, we should push GAP event"); */
-          /*   gst_pad_push_event (ps->pad, gst_event_new_gap (curpcr, 0)); */
-          /*   ps->gap_ref_pts = curpcr; */
-        } else {
-          ps->gap_ref_pts = ps->pts;
-          ps->gap_ref_buffers = ps->nb_out_buffers;
-        }
-      }
+      gst_ts_demux_check_and_sync_streams (demux, curpcr);
     }
   }
 
