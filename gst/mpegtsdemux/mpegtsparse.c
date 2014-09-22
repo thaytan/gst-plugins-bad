@@ -689,6 +689,9 @@ get_pending_timestamp_diff (MpegTSParse2 * parse)
   GList *l;
   GstClockTime first_ts, last_ts;
 
+  if (parse->pending_buffers == NULL)
+    return GST_CLOCK_TIME_NONE;
+
   l = g_list_last (parse->pending_buffers);
   first_ts = GST_BUFFER_PTS (l->data);
   if (first_ts == GST_CLOCK_TIME_NONE)
@@ -714,6 +717,8 @@ drain_pending_buffers (MpegTSParse2 * parse, gboolean drain_all)
   GstBuffer *buffer;
   GList *l, *end = NULL;
 
+  if (parse->pending_buffers == NULL)
+    return GST_FLOW_OK;         /* Nothing to push */
 
   /*
    * There are 4 cases:
@@ -801,6 +806,7 @@ drain_pending_buffers (MpegTSParse2 * parse, gboolean drain_all)
         GST_TIME_ARGS (GST_BUFFER_PTS (buffer)), GST_TIME_ARGS (out_ts));
 
     GST_BUFFER_PTS (buffer) = out_ts;
+    GST_BUFFER_DTS (buffer) = out_ts;
     if (ret == GST_FLOW_OK)
       ret = gst_pad_push (parse->srcpad, buffer);
     else
