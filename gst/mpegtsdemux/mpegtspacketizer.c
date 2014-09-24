@@ -107,8 +107,8 @@ struct _MpegTSPacketizerPrivate
 
 static void mpegts_packetizer_dispose (GObject * object);
 static void mpegts_packetizer_finalize (GObject * object);
-static GstClockTime calculate_skew (MpegTSPCR * pcr, guint64 pcrtime,
-    GstClockTime time);
+static GstClockTime calculate_skew (MpegTSPacketizer2 * packetizer,
+    MpegTSPCR * pcr, guint64 pcrtime, GstClockTime time);
 static void record_pcr (MpegTSPacketizer2 * packetizer, MpegTSPCR * pcrtable,
     guint64 pcr, guint64 offset);
 
@@ -313,6 +313,7 @@ mpegts_packetizer_init (MpegTSPacketizer2 * packetizer)
   priv->nb_seen_offsets = 0;
   priv->refoffset = -1;
   priv->last_in_time = GST_CLOCK_TIME_NONE;
+  packetizer->pcr_discont_threshold = GST_SECOND;
 }
 
 static void
@@ -433,7 +434,8 @@ mpegts_packetizer_parse_adaptation_field_control (MpegTSPacketizer2 *
     if (packetizer->calculate_skew
         && GST_CLOCK_TIME_IS_VALID (packetizer->priv->last_in_time)) {
       pcrtable = get_pcr_table (packetizer, packet->pid);
-      calculate_skew (pcrtable, packet->pcr, packetizer->priv->last_in_time);
+      calculate_skew (packetizer, pcrtable, packet->pcr,
+          packetizer->priv->last_in_time);
     }
     if (packetizer->calculate_offset) {
       if (!pcrtable)
@@ -1300,7 +1302,8 @@ mpegts_packetizer_resync (MpegTSPCR * pcr, GstClockTime time,
  * Returns: @time adjusted with the clock skew.
  */
 static GstClockTime
-calculate_skew (MpegTSPCR * pcr, guint64 pcrtime, GstClockTime time)
+calculate_skew (MpegTSPacketizer2 * packetizer,
+    MpegTSPCR * pcr, guint64 pcrtime, GstClockTime time)
 {
   guint64 send_diff, recv_diff;
   gint64 delta;
@@ -1338,7 +1341,8 @@ calculate_skew (MpegTSPCR * pcr, guint64 pcrtime, GstClockTime time)
       send_diff = gstpcrtime - pcr->base_pcrtime;
     } else if (GST_CLOCK_TIME_IS_VALID (time)
         && pcr->last_pcrtime - gstpcrtime > 15 * GST_SECOND) {
-      /* Assume a reset */
+      /* Time jumped backward by > 15 seconds, and we have a timestamp
+       * to use to close the discont. Assume a reset */
       GST_DEBUG ("PCR reset");
       /* Calculate PCR we would have expected for the given input time,
        * essentially applying the reverse correction process
@@ -1365,10 +1369,22 @@ calculate_skew (MpegTSPCR * pcr, guint64 pcrtime, GstClockTime time)
           " corrected pcr time %" GST_TIME_FORMAT,
           GST_TIME_ARGS (pcr->pcroffset), GST_TIME_ARGS (gstpcrtime));
     } else {
-      GST_WARNING ("backward timestamps at server but no timestamps");
+      /* Small jumps backward, assume some arrival jitter and skip it */
       send_diff = 0;
-      /* at least try to get a new timestamp.. */
-      pcr->base_time = GST_CLOCK_TIME_NONE;
+
+      if (pcr->last_pcrtime - gstpcrtime < GST_SECOND) {
+        GST_WARNING
+            ("(small) backward timestamps at server or no buffer timestamps. Ignoring.");
+        /* This will trigger the no_skew logic before but leave other state
+         * intact */
+        time = GST_CLOCK_TIME_NONE;
+      } else {
+        /* A bigger backward step than packet out-of-order can account for. Reset base PCR time
+         * to be resynched the next time we see a PCR */
+        GST_WARNING
+            ("backward timestamps at server or no buffer timestamps. Resync base PCR");
+        pcr->base_pcrtime = GST_CLOCK_TIME_NONE;
+      }
     }
   } else
     send_diff = gstpcrtime - pcr->base_pcrtime;
@@ -1413,7 +1429,7 @@ calculate_skew (MpegTSPCR * pcr, guint64 pcrtime, GstClockTime time)
   /* if the difference between the sender timeline and the receiver timeline
    * changed too quickly we have to resync because the server likely restarted
    * its timestamps. */
-  if (ABS (delta - pcr->skew) > GST_SECOND) {
+  if (ABS (delta - pcr->skew) > packetizer->pcr_discont_threshold) {
     GST_WARNING ("delta - skew: %" GST_TIME_FORMAT " too big, reset skew",
         GST_TIME_ARGS (delta - pcr->skew));
     mpegts_packetizer_resync (pcr, time, gstpcrtime, TRUE);
@@ -1675,4 +1691,11 @@ mpegts_packetizer_set_reference_offset (MpegTSPacketizer2 * packetizer,
   GST_DEBUG ("Setting reference offset to %" G_GUINT64_FORMAT, refoffset);
 
   packetizer->priv->refoffset = refoffset;
+}
+
+void
+mpegts_packetizer_set_pcr_discont_threshold (MpegTSPacketizer2 * packetizer,
+    GstClockTime threshold)
+{
+  packetizer->pcr_discont_threshold = threshold;
 }

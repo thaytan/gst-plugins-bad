@@ -112,6 +112,7 @@ struct _MpegTSPacketizer2 {
   /* offset/bitrate calculator */
   gboolean       calculate_offset;
 
+  GstClockTime pcr_discont_threshold;
   MpegTSPacketizerPrivate *priv;
 };
 
@@ -199,6 +200,9 @@ mpegts_packetizer_pts_to_ts (MpegTSPacketizer2 * packetizer,
 G_GNUC_INTERNAL void
 mpegts_packetizer_set_reference_offset (MpegTSPacketizer2 * packetizer,
 					guint64 refoffset);
+G_GNUC_INTERNAL void
+mpegts_packetizer_set_pcr_discont_threshold (MpegTSPacketizer2 * packetizer,
+					GstClockTime threshold);
 G_END_DECLS
 
 #endif /* GST_MPEGTS_PACKETIZER_H */
