@@ -4352,6 +4352,23 @@ gst_dvd_bin_get_type
 </SECTION>
 
 <SECTION>
+<FILE>element-switchbin</FILE>
+<TITLE>switchbin</TITLE>
+GstSwitchBin
+<SUBSECTION Standard>
+GstSwitchBinClass
+GstSwitchBinPath
+GST_SWITCH_BIN
+GST_SWITCH_BIN_CAST
+GST_IS_SWITCH_BIN
+GST_SWITCH_BIN_CLASS
+GST_TYPE_SWITCH_BIN
+<SUBSECTION Private>
+gst_switch_bin_get_type
+gst_switch_bin_path_get_type
+</SECTION>
+
+<SECTION>
 <FILE>element-ttmlparse</FILE>
 <TITLE>ttmlparse</TITLE>
 GstTtmlParse

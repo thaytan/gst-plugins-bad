@@ -1,0 +1,34 @@
+<plugin>
+  <name>switchbin</name>
+  <description>switchbin</description>
+  <filename>../../gst/switchbin/.libs/libgstswitchbin.so</filename>
+  <basename>libgstswitchbin.so</basename>
+  <version>1.15.0.1</version>
+  <license>LGPL</license>
+  <source>gst-plugins-bad</source>
+  <package>GStreamer Bad Plug-ins git</package>
+  <origin>Unknown package origin</origin>
+  <elements>
+    <element>
+      <name>switchbin</name>
+      <longname>switchbin</longname>
+      <class>Generic/Bin</class>
+      <description>Switch between sub-pipelines (paths) based on input caps</description>
+      <author>Carlos Rafael Giani &lt;dv@pseudoterminal.org&gt;</author>
+      <pads>
+        <caps>
+          <name>sink</name>
+          <direction>sink</direction>
+          <presence>always</presence>
+          <details>ANY</details>
+        </caps>
+        <caps>
+          <name>src</name>
+          <direction>source</direction>
+          <presence>always</presence>
+          <details>ANY</details>
+        </caps>
+      </pads>
+    </element>
+  </elements>
+</plugin>
