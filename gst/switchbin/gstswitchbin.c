@@ -299,7 +299,6 @@ gst_switch_bin_init (GstSwitchBin * switch_bin)
   gst_object_unref (GST_OBJECT (pad));
 }
 
-
 static void
 gst_switch_bin_finalize (GObject * object)
 {
@@ -660,10 +659,6 @@ gst_switch_bin_switch_to_path (GstSwitchBin * switch_bin,
     GstSwitchBinPath *cur_path = switch_bin->current_path;
 
     if (cur_path->element != NULL) {
-      /* Unlock the element's state in case it was locked earlier
-       * so it can be set to NULL */
-      gst_element_set_locked_state (cur_path->element, FALSE);
-
       gst_element_set_state (cur_path->element, GST_STATE_NULL);
       gst_element_unlink (switch_bin->input_identity, cur_path->element);
     }
@@ -680,10 +675,6 @@ gst_switch_bin_switch_to_path (GstSwitchBin * switch_bin,
 
       /* There is a path element. Link it into the pipeline. Data passes through
        * it now, since its associated path just became the current one. */
-
-      /* Unlock the element's state in case it was locked earlier
-       * so its state can be synced to the switchbin's */
-      gst_element_set_locked_state (switch_bin_path->element, FALSE);
 
       /* TODO: currently, only elements with one "src" "sink" always-pad are supported;
        * add support for request and sometimes pads */
@@ -715,6 +706,9 @@ gst_switch_bin_switch_to_path (GstSwitchBin * switch_bin,
         goto finish;
       }
 
+      /* Unlock the element's state in case it was locked earlier
+       * so its state can be synced to the switchbin's */
+      gst_element_set_locked_state (switch_bin_path->element, FALSE);
       if (!gst_element_sync_state_with_parent (switch_bin_path->element)) {
         GST_ERROR_OBJECT (switch_bin,
             "could not sync the path element's state with that of the switchbin");
