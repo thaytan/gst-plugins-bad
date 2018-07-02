@@ -276,6 +276,7 @@ check_PROGRAMS = \
 	elements/pnm \
 	elements/rtponvifparse \
 	elements/rtponviftimestamp \
+	elements/switchbin \
 	elements/id3mux \
 	pipelines/mxf \
 	libs/isoff \
